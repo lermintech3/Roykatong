@@ -695,7 +695,7 @@ function syncObjs(items){
   items.sort((a,b)=>b.t-a.t);items=items.slice(0,60);const keys=new Set(items.map(i=>i.k));
   objs=objs.filter(o=>keys.has(o.key)||o.pending||o.doc==='local');
   const have=new Map(objs.map(o=>[o.key,o]));
-  for(const it of items){const o=have.get(it.k);if(o){o.doc=it.doc;o.pending=false;continue}objs.push(mk(it,{doc:it.doc,mine:it.doc===uid}))}
+  for(const it of items){const o=have.get(it.k);if(o){o.doc=it.doc;o.pending=false;continue}objs.push(mk(it,{doc:it.doc,mine:it.doc===uid||myKeys.includes(it.k)}))}
   updCount();
 }
 function ingest(snap){
@@ -707,15 +707,32 @@ function ingest(snap){
   total=tot;mode='online';syncObjs(items);
 }
 function goLocal(){if(mode==='local')return;mode='local';$('#shared').textContent='ตอนนี้เชื่อมแม่น้ำร่วมไม่ได้ กระทงจึงลอยอยู่บนหน้าจอเครื่องนี้เท่านั้น และจะจำไว้ในเบราว์เซอร์นี้';for(const it of localMine)if(!objs.some(o=>o.key===it.k))objs.push(mk(it,{doc:'local',mine:true}));updCount()}
+let remote=null,myKeys=store.get('lk.keys')||[];
+const API='/api/krathongs';
+function fallback(){if(!remote&&/^https?:$/.test(location.protocol))initCF();else goLocal()}
+function applyCF(d){
+  const items=(Array.isArray(d.items)?d.items:[]).map(it=>{const c=clean(it);if(c)c.doc='cf';return c}).filter(Boolean);
+  if(mode!=='online'){mode='online';objs=objs.filter(o=>o.doc!=='local'||o.pending)}
+  const n=Number(d.total);total=n>0?n:items.length;syncObjs(items);
+}
+async function getCF(ms){const ac=new AbortController(),tm=setTimeout(()=>ac.abort(),ms);try{const r=await fetch(API,{cache:'no-store',signal:ac.signal});if(!r.ok)throw 0;const d=await r.json();if(!d||!Array.isArray(d.items))throw 0;return d}finally{clearTimeout(tm)}}
+async function initCF(){
+  try{
+    applyCF(await getCF(10000));
+    remote={add:async it=>{const r=await fetch(API,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({k:it.k,n:it.n,w:it.w,s:it.s,f:it.f,c:it.c})});
+      if(r.status===429)throw new Error('slow');if(!r.ok)throw new Error('fail');applyCF(await r.json())}};
+    setInterval(async()=>{if(document.hidden)return;try{applyCF(await getCF(8000))}catch(e){}},15000);
+  }catch(e){remote=null;goLocal()}
+}
 (async()=>{
-  const cl=window.claude;if(!cl||typeof cl.use!=='function'){goLocal();return}
+  const cl=window.claude;if(!cl||typeof cl.use!=='function'){fallback();return}
   try{
     const[d,u]=await Promise.all([cl.use('db'),cl.use('user')]);
     if(u){try{uid=await u.id()}catch(e){}try{isOwner=!!(await u.isOwner())}catch(e){}}
-    if(!d||!uid){goLocal();return}
+    if(!d||!uid){fallback();return}
     db=d;const timer=setTimeout(()=>{if(mode==='connecting'){goLocal();toast('ยังเชื่อมสายน้ำร่วมไม่ได้ ลอยบนหน้าจอนี้ไปก่อน')}},10000);
     db.collection('krathongs').orderBy('updated','desc').limit(300).onSnapshot(s=>{clearTimeout(timer);ingest(s)},()=>{clearTimeout(timer);db=null;goLocal()});
-  }catch(e){goLocal()}
+  }catch(e){fallback()}
 })();
 
 /* ---------- the ritual ---------- */
@@ -725,7 +742,7 @@ $('#go').addEventListener('click',()=>{
   const name=$('#nm').value.trim().slice(0,30),wish=ws.value.trim().slice(0,160)||'ขอขมาพระแม่คงคา และขอให้ความทุกข์ลอยไปกับสายน้ำ';
   store.set('lk.name',name);
   const it={k:Date.now().toString(36)+Math.random().toString(36).slice(2,8),n:name||'ผู้ไม่ประสงค์ออกนาม',w:wish,s:sel.s,f:sel.f,c:sel.c,t:Date.now()};
-  const o=mk(it,{near:true,mine:true,doc:db&&uid?uid:'local'});o.lit=0;o.state='light';o.pending=true;o.rot=pvObj.rot;objs.push(o);
+  const o=mk(it,{near:true,mine:true,doc:db&&uid?uid:remote?'cf':'local'});o.lit=0;o.state='light';o.pending=true;o.rot=pvObj.rot;objs.push(o);
   hide();ws.value='';wc();
   const r=$('#ritual');$('#r1').textContent='จุดเทียน จุดธูป';$('#r2').textContent='';r.classList.add('on');
   bell(SCALE[0],.07,.1);bell(SCALE[2],.06,.5);
@@ -734,9 +751,12 @@ $('#go').addEventListener('click',()=>{
   let saved;
   if(db&&uid&&mode==='online'){
     saved=queue(async()=>{const next=[it,...myItems.filter(i=>i.k!==it.k)].slice(0,6);await db.doc('krathongs/'+uid).set({items:next,count:myCount+1,updated:Date.now()});myItems=next;myCount++;o.pending=false;return true}).catch(()=>false);
+  }else if(remote&&mode==='online'){
+    myKeys=[it.k,...myKeys].slice(0,50);store.set('lk.keys',myKeys);
+    saved=remote.add(it).then(()=>{o.pending=false;return true},e=>{if(e&&e.message==='slow')setTimeout(()=>toast('ลอยถี่เกินไป กระทงนี้ลอยบนหน้าจอนี้ก่อนนะ'),5300);return false});
   }else saved=Promise.resolve(false);
   saved.then(ok=>{if(!ok){o.doc='local';localMine=[clean(it),...localMine].slice(0,12);store.set('lk.mine',localMine);if(mode!=='online')updCount()}
-    setTimeout(()=>toast(ok?'กระทงของคุณลอยไปพร้อมคำอธิษฐานแล้ว ขอให้สมดังปรารถนา':(mode==='online'?'ลอยบนหน้าจอนี้แล้ว บัญชีนี้ยังไม่มีสิทธิ์ลอยในสายน้ำร่วม':'กระทงของคุณลอยไปแล้ว ขอให้สมดังปรารถนา')),5200)});
+    setTimeout(()=>toast(ok?'กระทงของคุณลอยไปพร้อมคำอธิษฐานแล้ว ขอให้สมดังปรารถนา':(mode==='online'?(remote?'ลอยบนหน้าจอนี้แล้ว ยังส่งเข้าสายน้ำร่วมไม่ได้ในตอนนี้':'ลอยบนหน้าจอนี้แล้ว บัญชีนี้ยังไม่มีสิทธิ์ลอยในสายน้ำร่วม'):'กระทงของคุณลอยไปแล้ว ขอให้สมดังปรารถนา')),5200)});
 });
 
 addEventListener('resize',()=>{resize();if(openSheet==='build')sizePreview()});
